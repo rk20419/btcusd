@@ -1,0 +1,4 @@
+3.11.9   python verson
+python -m venv venv   ceate venv
+source venv/Scripts/activate     # Git Bash / VS Code terminal me
+python -m pip install --upgrade pip setuptools wheel
