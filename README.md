@@ -1,267 +1,241 @@
-BTC/USD Multi-Timeframe Thinker Prediction System: Comprehensive In-Depth Summary
-1. System Introduction
-The BTC/USD Multi-Timeframe Thinker Prediction System is an unsupervised, real-time framework that emulates expert trader decision-making to predict 300+ point price moves ($115,000–$125,000 in 2–4 hours) with ≥70% accuracy. Built on a modular directory structure (BTC/), it uses historical and live data in standardized formats:
+BTC/USD Expert Prediction System
+Overview
+The BTC/USD Expert Prediction System is a self-thinking AI engine designed to predict significant price movements (300+ points, including continuations like 2000+ points) in Bitcoin (BTC) against USD on 1-minute (1m) Binance candles. It analyzes 12-value candle data, generates Buy/Sell/Neutral signals with Stop Loss (SL), Take Profit (TP), confidence scores, and average time per move. The system integrates external data (whale detection via CBLOF, news sentiment via Bi-LSTM/TAM) and uses machine learning (LSTM/Transformer), hybrid methods (Random Forest/XGBoost), backtesting, session adaptations, and logging. Built entirely with free, open-source tools and APIs for accessibility, targeting ~85% accuracy.
+Purpose: Educational and paper trading; not financial advice. Cryptocurrency trading is high-risk.
 
-OHLCV Data: timestamp (milliseconds), open, high, low, close, volume.
-Tick Data: timestamp, Price, Volume (live raw data).
-News Data: timestamp, Text.
+Features
 
-Key techniques include sliding windows (20–200 candles, KMeans-clustered), volatility transitions, hierarchical TF integration (1m flows embedded into higher TFs), news sentiment refinement (FinBERT-tone ~0.85 for ETF inflows), and fakeout detection (volume persistence >3 ticks, wick/body ratios >1.5, sentiment mismatches). The system is optimized for Windows (MinGW), uses cache_system.py for real-time access, eliminates CSV crawling, and provides cache_view.csv for monitoring. Outputs are JSON signals saved to predictions_20250813.parquet (updated for current date August 13, 2025).
-1.1 Market Context (August 13, 2025)
+Flow-Based Analysis: Detects price moves using momentum, volume, and volatility/taker pressure.
+Data Format: Processes 12-value candles:
+timestamp (int, Unix ms)
+open, high, low, close (float, prices)
+volume, quote_volume, taker_buy_base, taker_buy_quote (float, volumes)
+trades (int, number of trades)
+volatility (float, rolling std dev of returns * 100)
+datetime_ist (string, IST format YYYY-MM-DD HH:MM:SS)
 
-Price Range: BTC/USD ~$118,000–$122,321, with bullish ETF inflows and Fed rate cut optimism pushing toward $123,200–$128,000 (sources: CryptoRank, Investing.com).
-Risks: Double top rejection could pull back to $110,000–$114,000 (Seeking Alpha, Cointelegraph).
-Sentiment: FinBERT-tone ~0.85 positive for ETF approvals (2.5 impact score), driving 300+ point moves; negative sentiment (e.g., cycle breaking, CNBC) signals fakeouts.
-Volatility: High-volume spikes (e.g., 55.17505 for 1m at timestamp=1100603) indicate breakouts, validated by 1m flows.
 
-1.2 Core Requirements
+External Integration: Whale detection (on-chain anomalies) and news sentiment (text trajectories).
+ML Models: LSTM/Transformer for patterns, Random Forest for feature ranking, XGBoost for ensembles.
+Session Adaptation: Adjusts for trading sessions (Asia: 00-08 UTC, London: 08-16 UTC, NY: 16-00 UTC).
+Dynamic Metrics: Risk Score (0-100), Drift Detection (MSE-based retraining), Avg Time/Move.
+Backtesting: Validates on 50,000 candles.
+Logging: Detailed JSON/CSV logs with visualizations.
+Free Resources: No paid APIs; uses free tiers and open-source libraries.
 
-Multi-TF Predictions: Independent models per TF, fused with 1m embedded in higher TFs.
-Dynamic Calculations: Windows (20–200), thresholds, avg_move_time via KMeans/HMM.
-300+ Point Moves: Non-retracing, ≥3 USD profit on 0.01 lots (100 points = 1 USD).
-TP/SL Logic: TP1 (100-point centroid), TP2 (200–500 points), SL (swing low + 1.2x 1m ATR), sentiment-adjusted.
-Fakeout Detection: Volume persistence (>3 ticks), wick/body ratios (>1.5), mismatches.
-Accuracy: ≥70% via backtesting on historical data, +10% with sentiment.
-Data Handling: Historical/live CSVs, atomic writes to avoid errors.
-Sentiment: FinBERT-tone boosts 4h/1d accuracy.
-Output: JSON (signal, confidence, tp1, tp2, sl, avg_move_points, avg_move_time, reasons, fakeout_risk).
-Unsupervised Models: CNN-LSTM autoencoders, KMeans, HMM, zero-shot FinBERT.
-Real-Time: Tick-by-tick, <50ms latency.
-Workflow: Pipeline → Analysis (Modules 2–5) → Fakeout → Fusion → Confirmation → Risk → Drift → Output.
 
-1.3 Data Specifications
-Both historical and live datasets have identical candle counts per TF:
+Prerequisites
 
-1m: 25,000 candles (~17.36 days).
-3m: 15,000 candles (~31.25 days).
-5m: 15,000 candles (~52.08 days).
-15m: 5,000 candles (~52.08 days).
-30m: 5,000 candles (~104.17 days).
-1h: 5,000 candles (~208.33 days).
-4h: 5,000 candles (~2.28 years).
-1d: 5,000 candles (~13.7 years).
-Live Updates: Data appended in real-time via websocket_client.py; raw tick data streamed to live_raw_data.csv.
-Sufficiency: Supports training (historical) and prediction (live), with ~17-day overlap for 1m.
+Python 3.8+: Core language.
+Libraries:
+pandas, numpy: Data handling.
+scikit-learn: CBLOF, Random Forest.
+pytorch: LSTM/Transformer models.
+xgboost: Ensemble classification.
+websocket-client: Binance WebSocket streaming.
+backtrader or zipline: Backtesting.
+matplotlib: Visualizations.
+pytz: Timezone handling.
+requests: API calls.
+Install via: pip install pandas numpy scikit-learn torch xgboost websocket-client backtrader matplotlib pytz requests
 
-2. Directory Structure
+
+APIs (free tiers):
+Binance API/WebSocket: Klines and live data (wss://stream.binance.com:9443).
+Blockchain.com/Blockchair/CryptoQuant/CoinGecko: On-chain data.
+NewsAPI.org/CryptoNews-API.com/NewsData.io/CoinDesk/Finnhub/Twinword: News/sentiment.
+X API: Social media posts (within 9k words/month limit).
+
+
+Data: Historical BTC/USD data from Kaggle or CryptoDataDownload.
+Environment: Google Colab or AWS Free Tier for cloud deployment; local machine for development.
+
+
+Installation
+
+Clone Repository (if hosted):git clone <repository-url>
+cd btc-usd-prediction-system
+
+
+Install Dependencies:pip install -r requirements.txt
+
+Sample requirements.txt:pandas
+numpy
+scikit-learn
+torch
+xgboost
+websocket-client
+backtrader
+matplotlib
+pytz
+requests
+
+
+Set Up Directories:
+Run websocket_client.py to initialize data/live and logs directories.
+Ensure write permissions for CSV/JSON outputs.
+
+
+API Keys (optional for free tiers):
+Configure Binance API keys (if exceeding rate limits).
+Set up X API/NewsAPI.org keys in a .env file or script configuration.
+
+
+
+
+Usage
+
+Data Collection:
+Run websocket_client.py to stream live 1m BTC/USDT candles:python websocket_client.py
+
+
+Outputs: data/live/1m.csv (candles), data/live/live_raw_data.csv (ticks).
+Logs: logs/live_stream_data.log.
+
+
+Training:
+Preprocess 50,000 candles (Module 1).
+Train models: LSTM (Module 2), CBLOF (Module 3), Bi-LSTM/TAM (Module 4).
+Fuse (Module 6) and backtest (Module 8).
+Use Jupyter Notebooks for experimentation.
+
+
+Live Prediction:
+Stream data, process through modules, generate signals (Module 5).
+Output: JSON/CSV files (signals.json, fused_decisions.json, etc.).
+
+
+Visualization:
+Use matplotlib for flow charts (Module 9).
+Example: Plot price moves with signals.
+
+
+
+
+System Architecture
+The system is modular, with each module handling a specific task. All modules use the 12-value candle format and free resources.
+1️⃣ Module 1 — Data Pipeline
+
+Purpose: Organize 1m candles, normalize, create sequences (100-200 candles), detect sessions.
+Input: Binance API/WebSocket data (12 values).
+Process: Normalize floats, convert timestamp to datetime_ist, add whale/sentiment features, log in JSON/CSV.
+Output: flow_sequences.pkl.
+
+2️⃣ Module 2 — Price Flow Analyzer
+
+Purpose: Detect 300+ point moves via momentum (close), volume (volume/trades), volatility/taker pressure.
+Process: LSTM with Attention, session-based thresholds, backtesting.
+Output: move_detections.json.
+
+3️⃣ Module 3 — Whale Detection
+
+Purpose: Identify large transfers using CBLOF on on-chain data.
+Process: Cluster anomalies, Transformer for sequences, fuse into flow.
+Output: whale_alerts.json.
+
+4️⃣ Module 4 — News Sentiment
+
+Purpose: Extract pos/neg/neutral sentiment from news/X posts.
+Process: Bi-LSTM/TAM, fine-tune on crypto data, calculate volatility.
+Output: sentiment_trajectories.json.
+
+5️⃣ Module 5 — Signal Generator
+
+Purpose: Generate Buy/Sell/Neutral signals.
+Process: Ensemble (LSTM + XGBoost), session rules, risk score.
+Output: signals.json.
+
+6️⃣ Module 6 — Meta-Flow Fusion
+
+Purpose: Combine all inputs for final bias.
+Process: Transformer weighting, drift detection, avg time/move.
+Output: fused_decisions.json.
+
+7️⃣ Module 7 — Risk Manager
+
+Purpose: Set SL/TP, manage exposure.
+Process: Dynamic SL/TP, trailing SL, risk score.
+Output: risk_params.json.
+
+8️⃣ Module 8 — Backtest & Optimization
+
+Purpose: Validate and tune system.
+Process: Simulate on 50,000 candles, grid search for hyperparameters.
+Output: backtest_report.json.
+
+9️⃣ Module 9 — Output & Logging
+
+Purpose: Export predictions, log data/signals.
+Process: Save JSON/CSV, visualize with matplotlib.
+Output: final_output.json.
+
+
+Neutral Waiting Logic
+
+If no 300+ point move and market is stable (low volatility): Monitor flow with whale/sentiment alerts.
+
+Training vs Live Flow
+
+Training:
+Preprocess sequences (Module 1).
+Train LSTM/CBLOF/Bi-LSTM (Modules 2-4).
+Fuse (Module 6), backtest (Module 8).
+
+
+Live:
+Stream data via WebSocket.
+Process through modules, output signals/logs.
+
+
+
+
+Free Resources
 
 Data:
-Historical: data/historical/{tf}.csv.
-Live: data/live/{tf}.csv, live_raw_data.csv, news_data.csv, cache_view.csv, predictions_20250813.parquet, archive/ticks_YYYYMMDD.csv.
+Binance API/WebSocket: Free klines and streaming.
+Blockchain.com/Blockchair/CryptoQuant/CoinGecko: On-chain data.
+NewsAPI.org/CryptoNews-API.com/NewsData.io/CoinDesk/Finnhub/Twinword: News/sentiment.
+X API: Social media (free tier).
+Kaggle/CryptoDataDownload: Historical data.
 
 
-Utils: cache_system.py, helpers.py, feature_engineering.py, logging_config.py, constants.py, logs/.
-Stream: websocket_client.py, tick_processor.py, queue_manager.py.
-Modules: Folders 1–10 with scripts, logs, artifacts.
-Config: config.yaml, requirements.txt.
+Tools:
+Python, pandas, numpy: Data processing.
+scikit-learn: CBLOF/Random Forest.
+PyTorch/Hugging Face: LSTM/Transformer models.
+backtrader/Zipline: Backtesting.
+matplotlib: Visualizations.
+Jupyter Notebooks: Development.
+Google Colab/AWS Free Tier: Deployment.
 
-3. Modules
-Module 1: Data Pipeline
 
-File: module1/data_pipeline.py.
-Execution Flow:
-Load from cache["historical"] (training) or cache["live"] (prediction).
-Resample 1m to higher TFs.
-Compute features via feature_engineering.py.
-Handle gaps/interpolation via helpers.py.
-Merge live ticks, buffer for TF completion.
 
 
-Models: KMeans for windows.
-Outputs: Multi-TF DataFrames with features.
-Logging: utils/logs/data_pipeline.log.
-Artifacts: Scalers (scaler_{tf}.pkl).
+Limitations
 
-Module 2: Price Action Model
+Relies on free API limits (e.g., X API 9k words/month).
+No internet installs in some execution environments.
+Requires fine-tuning for 2025 crypto trends.
+Designed for educational/paper trading; real trading risks capital.
 
-File: module2/price_action.py.
-Execution Flow:
-Input hierarchical windows from cache.
-Train CNN-LSTM on historical; infer on live.
-Cluster embeddings for direction; calculate TP/SL.
 
+Future Enhancements
 
-Models: CNN-LSTM, KMeans (3 clusters: UP/DOWN/NEUTRAL).
-Outputs: Signal with confidence, TP/SL, avg_move_points/time.
-Logging: data/live/module{tf}_predictions.log.
-Artifacts: autoenc_{tf}.h5, kmeans_patterns.pkl.
+Add a user interface (e.g., Flask/Dash) for manual overrides.
+Expand to other crypto pairs (e.g., ETH/USD).
+Integrate more data sources if free tiers expand.
+Optimize for lower latency in live mode.
 
-Module 3: Sentiment Analyzer
 
-File: module3/sentiment_analyzer.py.
-Execution Flow:
-Input last 10–20 news texts.
-Score sentiment with FinBERT; cluster events with GPT-2.
-Check fakeouts using raw ticks.
+Contributing
 
+Fork the repository, submit pull requests.
+Report issues via GitHub Issues (if hosted).
+Suggest improvements for models or data sources.
 
-Models: FinBERT-tone, GPT-2 (KMeans).
-Outputs: Sentiment score, event, impact, avg_move_time.
-Logging: utils/logs/sentiment_analyzer.log.
-Artifacts: kmeans_events.pkl.
 
-Module 4: Session Behavior Model
+License
+MIT License – free to use, modify, and distribute. See LICENSE file for details.
 
-File: module4/session_behavior.py.
-Execution Flow:
-Input 4–8h windows.
-Train/infer LSTM for BREAKOUT/RANGE.
-
-
-Models: Time-Aware LSTM, KMeans.
-Outputs: Session type, confidence, avg_move_time.
-Logging: utils/logs/session_behavior.log.
-Artifacts: lstm_session.h5.
-
-Module 5: Regime Detector
-
-File: module5/regime_detector.py.
-Execution Flow:
-Input volatility/returns.
-Train/infer HMM for regimes.
-
-
-Models: GaussianHMM, KMeans.
-Outputs: Regime, confidence, avg_move_time.
-Logging: utils/logs/regime_detector.log.
-Artifacts: hmm_regime.pkl.
-
-Module 6: Meta-Brain
-
-File: module6/meta_brain.py.
-Execution Flow:
-Fuse outputs from Modules 2–5.
-Apply attention, penalize conflicting TFs.
-
-
-Models: Attention layer, KMeans.
-Outputs: Fused signal with TP/SL, avg_move_points/time.
-Logging: utils/logs/meta_brain.log.
-Artifacts: attention_weights.pkl.
-
-Module 7: Confirmation Filter
-
-File: module7/confirmation_filter.py.
-Execution Flow:
-Validate fused signals (ATR ≥300, TF agreement ≥70%, stability >3 ticks).
-
-
-Outputs: Approved or rejected signal.
-Logging: utils/logs/confirmation_filter.log.
-Artifacts: thresholds.pkl.
-
-Module 8: Risk Advisory
-
-File: module8/risk_advisory.py.
-Execution Flow:
-Calculate TP/SL/sizing for 0.01 lots.
-
-
-Outputs: Risk-integrated signal.
-Logging: utils/logs/risk_advisory.log.
-Artifacts: risk_params.pkl.
-
-Module 9: Drift Detection
-
-File: module9/drift_detection.py.
-Execution Flow:
-Monitor 20–30 signals; flag if accuracy drops >10%.
-
-
-Outputs: Status, accuracy.
-Logging: utils/logs/drift_detection.log.
-Artifacts: drift_metrics.pkl.
-
-Module 10: Output & Logging
-
-File: module10/output_logging.py.
-
-Execution Flow:
-
-Compile and save JSON predictions.
-
-
-Outputs: predictions_20250813.parquet.
-
-Logging: utils/logs/output_logging.log.
-
-Artifacts: output_schema.pkl.
-
-Sample Output:
-{
-  "timestamp": "2025-08-13T03:46:56.000Z",
-  "tf": "fused",
-  "signal": "BUY",
-  "confidence": 91,
-  "tp1": 122500.0,
-  "tp2": 123000.0,
-  "sl": 121500.0,
-  "avg_move_points": 450,
-  "avg_move_time": "2h",
-  "reasons": ["Stable 1m flow", "TF-aligned", "ETF sentiment: 0.85"],
-  "fakeout_risk": "Cleared",
-  "module_stats": {
-    "1m": {"signal": "BUY", "conf": 85},
-    "5m": {"signal": "BUY", "conf": 78},
-    "sentiment": {"score": 0.85, "event": "ETF_APPROVAL"}
-  }
-}
-
-
-
-Utilities
-Cache System (utils/cache_system.py)
-
-Functionality: Caches live data (cache["live"][tf], cache["raw_ticks"]), updates every 1 second, writes cache_view.csv.
-Gap Handling: Detects >1.2x TF interval gaps, logs during market hours.
-Integration: Modules access cache, eliminating CSV reads; fixes KeyError: 'Timestamp'.
-Logging: utils/logs/cache_system.log.
-
-Constants (utils/constants.py)
-
-Defines: TIMEFRAMES, TF_INTERVALS, FEATURES, WINDOW_SIZES, DATA_DIR, RAW_TICK_FILE, MAX_GAP_MS=5000, MIN_300_POINTS=300, MIN_CONFIDENCE=70, ATR_MULTIPLIER=1.2, STABILITY_WINDOW=3, EPOCHS=100, BATCH_SIZE=32.
-
-Feature Engineering (utils/feature_engineering.py)
-
-Computes: RSI (14), MACD (12,26,9), ATR (14), vol_delta, cumulative_delta, whale_flag (KMeans), stability_score (3 ticks).
-Logging: utils/logs/feature_engineering.log.
-
-Helpers (utils/helpers.py)
-
-Functions: standardize_timestamps, interpolate_gaps (<5s forward-fill), align_timeframes (~17 days), fallback_to_lower_tf (3m/5m for 1m).
-Logging: utils/logs/helpers.log.
-
-Logging Config (utils/logging_config.py)
-
-Sets up loggers for modules/utilities, per-TF for price action.
-Format: %(asctime)s - %(name)s - %(levelname)s - %(message)s.
-
-WebSocket Client (stream/websocket_client.py)
-
-Streams BTC/USDT kline (OHLCV) and tick data from Binance WebSocket.
-Saves: Completed candles to data/live/{tf}.csv, ticks to data/live/live_raw_data.csv.
-Logging: logs/live_stream_data.log.
-
-Data Flow
-
-Historical (Training): Load data/historical/{tf}.csv (25,000 1m, etc.), preprocess (helpers.py), compute features (feature_engineering.py), train models (Modules 2, 4, 5).
-Live (Prediction): Stream via websocket_client.py, cache (cache_system.py), preprocess, predict (Modules 2–10), save to predictions_20250813.parquet.
-Real-Time Updates: Live data appended; cache updated every 1s; cache_view.csv for monitoring.
-
-Improvements & Tweaks
-
-Latency: Use asyncio.Queue in queue_manager.py.
-Alerts: Drift window to 20 signals; pause if accuracy <60%.
-Features: Add funding rates/open interest.
-Penalty: Reject if 1m opposes higher TFs (≥70% conf).
-Archiving: Daily ticks to archive/ticks_YYYYMMDD.csv.
-
-Execution Steps
-
-Run websocket_client.py for live data.
-Run cache_system.py for caching.
-Train models with historical data.
-Generate predictions with live data.
-Monitor logs and cache_view.csv.
-
-The system is ready for deployment. Share issues or logs for further assistance!
+Contact
+For questions or feedback, reach out via GitHub or X (@your_handle). Built for educational purposes by a crypto enthusiast.
