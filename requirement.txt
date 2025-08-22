@@ -16,4 +16,5 @@ schedule
 certifi
 imblearn
 fastdtw
-psutil
+xgboost
+optuna
