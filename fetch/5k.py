@@ -16,7 +16,7 @@ class Config:
     BASE_URL: str = "https://api.binance.com/api/v3/klines"
     SYMBOL: str = "BTCUSDT"
     TIMEFRAMES: Dict[str, int] = field(default_factory=lambda: {
-        "1m":100000
+        "1m":200000
     })
     LIMIT: int = 1000  # Max candles per request
     OUTPUT_DIR: str = "data/historical"

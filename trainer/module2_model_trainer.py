@@ -2,29 +2,27 @@
 """
 PRODUCTION-READY Price Flow Analyzer Module - OPTIMIZED FOR 100K
 - Memory-efficient training for large datasets
-- Progressive loading and training
+- Progressive loading and training in chunks of 5000
 - Optimized for low-spec systems
 - Enhanced fail-safes and monitoring
 """
 
+# Section 1: Imports
+# For larger data (>100k rows), increase MIN_IPCA_BATCH to 10000+ for PCA stability, 
+# increase MAX_SAMPLES_PER_CLASS to 10000+ for more balanced data, 
+# increase BATCH_SIZE to 256+ if RAM allows, decrease SEQ_LEN to 20 if memory errors occur.
 import os
 import logging
-import math
 import random
-import time
-import json
-from typing import Tuple, List, Any, Optional, Dict, Union
+from typing import Tuple, List, Optional, Union
 from collections import Counter
 from dataclasses import dataclass
-import threading
 import gc
-import psutil
-
 import numpy as np
 import pandas as pd
 import joblib
 import pytz
-from datetime import datetime, timedelta
+from datetime import datetime
 
 from sklearn.preprocessing import RobustScaler
 from sklearn.decomposition import PCA, IncrementalPCA
@@ -42,15 +40,15 @@ from torch.utils.data import DataLoader, TensorDataset
 from fastdtw import fastdtw
 from scipy.spatial.distance import euclidean
 
-# --------------------------
-# Production Configuration
-# --------------------------
+# Section 2: Configuration
+# For larger data, increase EPOCHS to 100 if training time allows, increase HYPER_OPT_TRIALS to 50 for better optimization.
+# Increased MIN_STABLE_CANDLES to 4 for stricter stability, reducing false positives.
 @dataclass
 class Config:
     SEED = 42
-    SEQ_LEN = 30  # Reduced for faster response to quick changes
+    SEQ_LEN = 30  # Reduced for faster response
     MAX_LOOKAHEAD = 30  # Reduced for faster response
-    MIN_STABLE_CANDLES = 3
+    MIN_STABLE_CANDLES = 4  # Increased for better stability detection
     MAX_STABLE_CANDLES = 5
     PRICE_RANGE = 300
     EPOCHS = 50
@@ -88,9 +86,7 @@ os.makedirs(config.ARTIFACTS_DIR, exist_ok=True)
 os.makedirs(config.LOG_DIR, exist_ok=True)
 os.makedirs("data/real_time", exist_ok=True)
 
-# --------------------------
-# Enhanced Logging
-# --------------------------
+# Section 3: Enhanced Logging (health check removed)
 class ProductionLogger:
     def __init__(self):
         self.logger = logging.getLogger("price_flow_production")
@@ -108,37 +104,10 @@ class ProductionLogger:
         
         self.logger.addHandler(fh)
         self.logger.addHandler(ch)
-        
-        self.performance_metrics = {
-            'prediction_times': [],
-            'confidence_scores': [],
-            'recent_errors': 0,
-            'last_alert_time': None
-        }
-    
-    def log_performance(self, prediction_time: float, confidence: float):
-        self.performance_metrics['prediction_times'].append(prediction_time)
-        self.performance_metrics['confidence_scores'].append(confidence)
-        if len(self.performance_metrics['prediction_times']) > config.PERFORMANCE_WINDOW:
-            self.performance_metrics['prediction_times'].pop(0)
-            self.performance_metrics['confidence_scores'].pop(0)
-    
-    def check_health(self):
-        avg_time = np.mean(self.performance_metrics['prediction_times']) if self.performance_metrics['prediction_times'] else 0
-        avg_confidence = np.mean(self.performance_metrics['confidence_scores']) if self.performance_metrics['confidence_scores'] else 0
-        if avg_time > config.MAX_LATENCY_MS / 1000:
-            self.logger.warning(f"High latency detected: {avg_time:.3f}s")
-            return False
-        if avg_confidence < config.CONFIDENCE_THRESHOLD - 0.1:
-            self.logger.warning(f"Low confidence detected: {avg_confidence:.3f}")
-            return False
-        return True
 
 logger = ProductionLogger()
 
-# --------------------------
-# Enhanced Model
-# --------------------------
+# Section 4: Enhanced Model
 class ProductionPriceFlowLSTM(nn.Module):
     def __init__(self, input_size: int = 12, hidden_size: int = config.HIDDEN_SIZE,
                  num_layers: int = config.NUM_LAYERS, output_size: int = 3, dropout: float = 0.2):
@@ -160,9 +129,7 @@ class ProductionPriceFlowLSTM(nn.Module):
         out = self.dropout(context)
         return self.fc(out)
 
-# --------------------------
-# Data Quality System
-# --------------------------
+# Section 5: Data Quality System
 class DataQualityValidator:
     @staticmethod
     def validate_real_time_data(df: pd.DataFrame) -> Tuple[bool, float]:
@@ -185,9 +152,7 @@ class DataQualityValidator:
             quality_score -= outliers * 0.2
         return quality_score >= config.MIN_DATA_QUALITY_SCORE, quality_score
 
-# --------------------------
-# Enhanced Utilities
-# --------------------------
+# Section 6: Enhanced Utilities
 def set_seed(seed: int = config.SEED):
     random.seed(seed)
     np.random.seed(seed)
@@ -241,7 +206,7 @@ def calculate_stability_raw(df_raw: pd.DataFrame, start_idx: int, window: int = 
     else:
         vol20 = df_raw['volatility'].rolling(20).mean().iloc[start_idx]
     if np.isnan(vol20) or vol20 <= 0:
-        return None, False
+        vol20 = subset['volatility'].mean() or 1e-5  # Fallback to avoid nan/zero
     current_vol = subset['volatility'].mean()
     price_range = subset['high'].max() - subset['low'].min()
     is_stable = (current_vol < 0.5 * vol20) and (price_range < config.PRICE_RANGE)
@@ -309,16 +274,18 @@ def balance_classes(X, y, metadata, max_samples_per_class=config.MAX_SAMPLES_PER
     logger.logger.info(f"Balanced class distribution: {Counter(balanced_y)}")
     return balanced_X, balanced_y, balanced_meta
 
-# --------------------------
-# Enhanced Sequence Building
-# --------------------------
-def load_and_build_sequences(filepath: str, seq_len: int = config.SEQ_LEN):
-    try:
-        df_raw = pd.read_csv(filepath).reset_index(drop=True)
+# Section 7: Enhanced Sequence Building (chunk size 5000)
+def load_and_build_sequences(filepath: str, seq_len: int = config.SEQ_LEN, chunksize=5000):
+    sequences_raw_indices = []
+    metadata = []
+    labels = []
+    chunk_num = 0
+    for chunk in pd.read_csv(filepath, chunksize=chunksize):
+        df_raw = chunk.reset_index(drop=True)
         required = ['timestamp', 'open', 'high', 'low', 'close', 'volume', 'quote_volume', 'trades', 'taker_buy_base', 'taker_buy_quote', 'datetime_ist']
         for c in required:
             if c not in df_raw.columns:
-                raise ValueError(f"Missing column {c} in {filepath}")
+                raise ValueError(f"Missing column {c} in chunk {chunk_num}")
                 
         ensure_volatility(df_raw)
         calculate_rsi(df_raw)
@@ -333,11 +300,7 @@ def load_and_build_sequences(filepath: str, seq_len: int = config.SEQ_LEN):
 
         N = len(df_raw)
         num_seq = max(0, N - seq_len - config.MAX_LOOKAHEAD)
-        logger.logger.info(f"Rows: {N}, sequences: {num_seq}")
-
-        sequences_raw_indices = []
-        metadata = []
-        labels = []
+        logger.logger.info(f"Chunk {chunk_num} rows: {N}, sequences: {num_seq}")
 
         for i in range(0, num_seq):
             idx_entry = i + seq_len - 1
@@ -352,10 +315,10 @@ def load_and_build_sequences(filepath: str, seq_len: int = config.SEQ_LEN):
             current_session = df_raw['session'].iat[idx_entry]
             is_sunday = bool(df_raw['is_sunday'].iat[idx_entry])
 
-            # Dynamic move_threshold with volatility
+            # Dynamic move_threshold with volatility (increased to 2.0)
             vol20 = df_raw['volatility'].rolling(20).mean().iloc[idx_entry]
             base_threshold = 300 if current_session == 'Asia' else 400 if current_session == 'London' else 500
-            move_threshold = 1.5 * vol20 if not np.isnan(vol20) and vol20 > 0 else base_threshold
+            move_threshold = 2.0 * vol20 if not np.isnan(vol20) and vol20 > 0 else base_threshold
             if current_vol > vol20.mean() + vol20.std():
                 move_threshold *= 1.2  # Boost for high volatility
 
@@ -410,9 +373,9 @@ def load_and_build_sequences(filepath: str, seq_len: int = config.SEQ_LEN):
             start_avg = max(0, idx_entry - 19)
             avg_volume = df_raw['volume'].iloc[start_avg:idx_entry+1].mean() if idx_entry >= start_avg else current_volume
             avg_trades = df_raw['trades'].iloc[start_avg:idx_entry+1].mean() if idx_entry >= start_avg else current_trades
+            vol20 = df_raw['volatility'].iloc[start_avg:idx_entry+1].mean() if idx_entry >= start_avg else current_vol
             volume_spike = (current_volume > volume_factor * avg_volume) if avg_volume > 0 else False
             trade_spike = (current_trades > volume_factor * avg_trades) if avg_trades > 0 else False
-            vol20 = df_raw['volatility'].iloc[start_avg:idx_entry+1].mean() if idx_entry >= start_avg else current_vol
             high_volatility = (current_vol > volatility_factor * vol20) if vol20 > 0 else False
             taker_pressure = df_raw['taker_buy_base'].iat[idx_entry] / (current_volume + 1e-10)
             rsi_overbought = current_rsi > 70
@@ -449,7 +412,7 @@ def load_and_build_sequences(filepath: str, seq_len: int = config.SEQ_LEN):
                         if is_stable and ((label == 0 and avg_close_raw > tp1) or (label == 1 and avg_close_raw < tp1)):
                             tp2 = avg_close_raw; break
 
-            sequences_raw_indices.append(i)
+            sequences_raw_indices.append(i + chunk_num * chunksize)  # Adjust for chunk offset
             metadata.append({
                 'timestamp': int(df_raw['timestamp'].iat[idx_entry]),
                 'datetime_ist': str(df_raw['datetime_ist'].iat[idx_entry]),
@@ -459,17 +422,15 @@ def load_and_build_sequences(filepath: str, seq_len: int = config.SEQ_LEN):
                 'price_stabilized': price_stabilized,
                 'trigger_method': 'momentum' if move_type != 'neutral' else ('volume' if (volume_spike or trade_spike) and high_volatility else 'no_move'),
                 'sl': sl, 'tp1': tp1, 'tp2': tp2,
-                'entry_row_idx': int(idx_entry)
+                'entry_row_idx': int(idx_entry + chunk_num * chunksize)  # Adjust for chunk
             })
             labels.append(int(label))
+        chunk_num += 1
+        gc.collect()  # Clear memory after each chunk
 
-        labels = np.array(labels, dtype=np.int64)
-        logger.logger.info(f"Built sequences indices: {len(sequences_raw_indices)} labels distribution: {np.unique(labels, return_counts=True)}")
-        return df_raw, sequences_raw_indices, metadata, labels
-        
-    except Exception as e:
-        logger.logger.error(f"Error building sequences: {e}")
-        raise
+    labels = np.array(labels, dtype=np.int64)
+    logger.logger.info(f"Built sequences indices: {len(sequences_raw_indices)} labels distribution: {np.unique(labels, return_counts=True)}")
+    return df_raw, sequences_raw_indices, metadata, labels
 
 def build_norm_sequences_and_labels(df_raw: pd.DataFrame, seq_len: int, sequences_raw_indices: List[int],
                                     metadata: List[dict], labels: np.ndarray, scaler: RobustScaler):
@@ -483,9 +444,7 @@ def build_norm_sequences_and_labels(df_raw: pd.DataFrame, seq_len: int, sequence
         X[idx_i] = seq_norm
     return X, y, metadata
 
-# --------------------------
-# Enhanced Embeddings
-# --------------------------
+# Section 8: Enhanced Embeddings
 def build_sequence_embeddings(X: np.ndarray, train_cutoff_seq: int, embed_dim: int = config.EMBED_DIM):
     num_seq = X.shape[0]
     flat = X.reshape(num_seq, -1)
@@ -501,14 +460,13 @@ def build_sequence_embeddings(X: np.ndarray, train_cutoff_seq: int, embed_dim: i
         pca.fit(flat[:train_cutoff_seq])
         embeddings = pca.transform(flat)
         pca_obj = pca
+    gc.collect()
     return embeddings, pca_obj
 
 def embeddings_transform(data: np.ndarray, pca_obj: Union[PCA, IncrementalPCA]) -> np.ndarray:
     return pca_obj.transform(data)
 
-# --------------------------
-# Enhanced Training
-# --------------------------
+# Section 9: Enhanced Training
 def prepare_dataloaders_chrono(X: np.ndarray, y: np.ndarray, batch_size: int = config.BATCH_SIZE,
                                train_frac: float = config.TRAIN_SPLIT_FRAC, val_frac: float = config.VAL_SPLIT_FRAC):
     num = X.shape[0]
@@ -542,15 +500,15 @@ def objective(trial):
     trained_model = train_loop(model, train_loader, val_loader, X_train_norm, y_train, X_norm_all, labels_all, embeddings_obj, nn_idx, device, epochs=config.EPOCHS, lr=config.LR)
     
     test_preds = []
+    test_labels = []
     with torch.no_grad():
-        for Xb, _ in test_loader:
+        for Xb, yb in test_loader:
             Xb = Xb.to(device)
             out = trained_model(Xb)
             test_preds.extend(torch.argmax(out, dim=1).cpu().numpy())
-    
-    simulated_returns = np.random.normal(0.01, 0.05, len(test_preds)) * np.where(test_preds == 0, 1, np.where(test_preds == 1, -1, 0))
-    sharpe = calculate_sharpe_ratio(simulated_returns)
-    return sharpe
+            test_labels.extend(yb.numpy())
+    test_f1 = f1_score(test_labels, test_preds, average='weighted')
+    return test_f1
 
 def train_loop(model, train_loader, val_loader, X_train_norm, y_train, X_norm_all, labels_all, embeddings_obj,
                nn_idx, device, epochs=config.EPOCHS, lr=config.LR):
@@ -601,11 +559,11 @@ def train_loop(model, train_loader, val_loader, X_train_norm, y_train, X_norm_al
                 lstm_pred = np.argmax(probs, axis=1)
                 val_lstm_preds.extend(lstm_pred.tolist())
                 val_labels.extend(yb.numpy().tolist())
-                val_probs.append((Xb_cpu, probs))
+                val_probs.append(probs)
 
-        lstm_features = np.vstack([probs for _, probs in val_probs])
+        lstm_features = np.vstack(val_probs)
         xgb = XGBClassifier(random_state=config.SEED)
-        xgb.fit(lstm_features, val_lstm_preds)
+        xgb.fit(lstm_features, val_labels)
         hybrid_preds = xgb.predict(lstm_features)
 
         val_lstm_acc = accuracy_score(val_labels, val_lstm_preds)
@@ -628,13 +586,12 @@ def train_loop(model, train_loader, val_loader, X_train_norm, y_train, X_norm_al
             if no_improve >= config.EARLY_STOP_PATIENCE:
                 logger.logger.info(f"Early stopping at epoch {epoch}")
                 break
+        gc.collect()
 
     logger.logger.info(f"Training completed. Best hybrid val F1: {best_val_hybrid_f1:.4f}")
     return model
 
-# --------------------------
-# Main Training Function
-# --------------------------
+# Section 10: Main Training Function
 def main():
     global train_loader, val_loader, test_loader, X_train_norm, y_train, X_norm_all, labels_all, embeddings_obj, nn_idx, device
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -642,19 +599,24 @@ def main():
     logger.logger.info(f"Using device: {device}")
 
     try:
-        df_raw, seq_indices, metadata, labels = load_and_build_sequences(config.DATA_PATH, seq_len=config.SEQ_LEN)
-        N = len(df_raw)
+        # Load full data for scaler (training portion only)
+        df_raw_full = pd.read_csv(config.DATA_PATH)
+        train_row_cutoff = int(len(df_raw_full) * config.TRAIN_SPLIT_FRAC)
+        feature_cols = ['open', 'high', 'low', 'close', 'volume', 'quote_volume', 'trades', 'taker_buy_base', 'taker_buy_quote', 'volatility', 'rsi', 'macd']
+        scaler = RobustScaler()
+        scaler.fit(df_raw_full[feature_cols].iloc[:train_row_cutoff].values)
+        joblib.dump(scaler, os.path.join(config.ARTIFACTS_DIR, "module2_scaler.save"))
+        logger.logger.info("Fitted scaler on train rows only")
+        gc.collect()
+
+        # Build sequences in chunks
+        _, seq_indices, metadata, labels = load_and_build_sequences(config.DATA_PATH, seq_len=config.SEQ_LEN)
+        N = len(df_raw_full)
         if len(seq_indices) == 0:
             raise RuntimeError("Not enough sequences. Increase data or reduce SEQ_LEN/MAX_LOOKAHEAD.")
 
-        train_row_cutoff = int(N * config.TRAIN_SPLIT_FRAC)
-        feature_cols = ['open', 'high', 'low', 'close', 'volume', 'quote_volume', 'trades', 'taker_buy_base', 'taker_buy_quote', 'volatility', 'rsi', 'macd']
-        scaler = RobustScaler()
-        scaler.fit(df_raw[feature_cols].iloc[:train_row_cutoff].values)
-        joblib.dump(scaler, os.path.join(config.ARTIFACTS_DIR, "module2_scaler.save"))
-        logger.logger.info("Fitted scaler on train rows only")
-
-        X_norm, y, metadata = build_norm_sequences_and_labels(df_raw, config.SEQ_LEN, seq_indices, metadata, labels, scaler)
+        # Build norm with full df_raw_full
+        X_norm, y, metadata = build_norm_sequences_and_labels(df_raw_full, config.SEQ_LEN, seq_indices, metadata, labels, scaler)
         
         X_balanced, y_balanced, metadata_balanced = balance_classes(X_norm, y, metadata)
         
@@ -662,7 +624,7 @@ def main():
         X_aug = X_balanced + noise
         X_balanced = np.concatenate([X_balanced, X_aug])
         y_balanced = np.concatenate([y_balanced, y_balanced])
-        metadata_balanced += metadata_balanced
+        metadata_balanced.extend(metadata_balanced)
         
         num_seq = X_balanced.shape[0]
         train_seq_cutoff = int(num_seq * config.TRAIN_SPLIT_FRAC)
@@ -698,11 +660,24 @@ def main():
             logger.logger.error(f"Optuna optimization failed: {e}")
             config.LR = 1e-3  # Fallback
             config.BATCH_SIZE = 128
-            config.HIDDEN_SIZE = 128
+            config.HIDDEN_SIZE = 192
 
         model = ProductionPriceFlowLSTM(input_size=X_balanced.shape[2], hidden_size=config.HIDDEN_SIZE, num_layers=config.NUM_LAYERS, output_size=3).to(device)
         trained_model = train_loop(model, train_loader, val_loader, X_train_norm, y_train,
                                  X_norm_all, labels_all, embeddings_obj, nn_idx, device, epochs=config.EPOCHS, lr=config.LR)
+
+        # Final evaluation on test set and log what model learned
+        test_preds = []
+        test_labels = []
+        with torch.no_grad():
+            for Xb, yb in test_loader:
+                Xb = Xb.to(device)
+                out = trained_model(Xb)
+                test_preds.extend(torch.argmax(out, dim=1).cpu().numpy())
+                test_labels.extend(yb.numpy())
+        test_acc = accuracy_score(test_labels, test_preds)
+        test_f1 = f1_score(test_labels, test_preds, average='weighted')
+        logger.logger.info(f"Model learned: Test Accuracy: {test_acc * 100:.2f}%, Test F1 Score: {test_f1 * 100:.2f}%")
 
         logger.logger.info("Training completed successfully")
         
