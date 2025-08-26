@@ -1,0 +1,57 @@
+# Python cache
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# Virtual environment
+venv/
+env/
+ENV/
+.venv/
+
+# Jupyter checkpoints
+.ipynb_checkpoints/
+
+# Data folders
+logs/
+data/
+datasets/
+*.csv
+*.xlsx
+*.json
+*jsonl
+
+# Logs
+*.log
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# models
+models/
+*.pkl
+*.pt
+*.pth
+*.save
+
+# models
+processes/
+*.pkl
+*.pt
+*.pth
+*.save
+
+# models
+scalers/
+*.pkl
+*.pt
+*.pth
+*.save
+
+# models
+production/
+*.npy
+*.pt
+*.pth
+*.save
