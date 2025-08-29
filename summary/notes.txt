@@ -2,3 +2,9 @@
 python -m venv venv   ceate venv
 source venv/Scripts/activate     # Git Bash / VS Code terminal me
 python -m pip install --upgrade pip setuptools wheel
+
+1756246793132,2025-08-27 03:49:53,synthetic_tx_199693_1756246793132,957,1181,673820,20967827858,synthetic_address_95,7,4,1,synthetic
+1756246951051,2025-08-27 03:52:31,synthetic_tx_199694_1756246951051,926,3656,525534,26992826120,synthetic_address_15,1,4,1,synthetic
+1756247108969,2025-08-27 03:55:08,synthetic_tx_199695_1756247108969,852,1963,651321,10232556704,synthetic_address_74,7,2,1,synthetic
+1756247266888,2025-08-27 03:57:46,synthetic_tx_199696_1756247266888,550,1479,252660,66120592959,synthetic_address_81,10,4,1,synthetic
+1756247424806,2025-08-27 04:00:24,synthetic_tx_199697_1756247424806,677,1978,460147,20309425535,synthetic_address_77,4,5,1,synthetic
