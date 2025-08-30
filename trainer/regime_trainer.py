@@ -1,16 +1,3 @@
-# File: trainer/regime_trainer.py
-"""
-Production-grade Module 2 Part A: Regime Detector Trainer
-
-- Input: processed chunks CSVs (processed/chunk_*.csv) OR a single processed CSV.
-- Output:
-  - models/gmm_model.pkl
-  - models/hmm_model.pkl
-  - regime_assignments.csv (timestamp, datetime_ist, regime, confidence)
-  - transition_probs.csv (from_regime, to_regime, prob)
-  - models/manifest_regime.json
-- Models: GaussianMixture (GMM) for regime clusters + GaussianHMM (hmmlearn) for transitions.
-"""
 from __future__ import annotations
 
 import argparse
@@ -23,7 +10,7 @@ import time
 import traceback
 from glob import glob
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import List, Optional, Tuple, Dict
 
 import joblib
 import numpy as np
@@ -43,6 +30,18 @@ from hmmlearn.hmm import GaussianHMM
 from logging.handlers import RotatingFileHandler
 
 pd.options.mode.chained_assignment = None
+
+# Regime type mapping for interpretability
+REGIME_MAPPING = {
+    0: "RANGE_LOW",
+    1: "RANGE_HIGH", 
+    2: "TREND_UP",
+    3: "TREND_DOWN",
+    4: "VOLATILE_UP", 
+    5: "VOLATILE_DOWN",
+    6: "STABLE_HIGH",
+    7: "STABLE_LOW"
+}
 
 def setup_logger(log_path: str = "logs/regime_trainer.log") -> logging.Logger:
     Path(log_path).parent.mkdir(parents=True, exist_ok=True)
@@ -77,6 +76,8 @@ class RegimeTrainer:
         random_state: int = 42,
         log_path: str = "logs/regime_trainer.log",
         manifest_name: str = "models/manifest_regime.json",
+        min_regime_duration: int = 5,  # Minimum candles for a regime to be valid
+        target_regimes: int = 8,  # Target number of regimes to identify
     ):
         self.processed_glob = processed_glob
         self.single_processed = single_processed
@@ -91,6 +92,8 @@ class RegimeTrainer:
         self.n_splits = n_splits
         self.random_state = random_state
         self.manifest_name = manifest_name
+        self.min_regime_duration = min_regime_duration
+        self.target_regimes = target_regimes
 
         self.logger = setup_logger(log_path)
 
@@ -98,6 +101,7 @@ class RegimeTrainer:
         self.scaler: Optional[StandardScaler] = None
         self.gmm: Optional[GaussianMixture] = None
         self.hmm: Optional[GaussianHMM] = None
+        self.regime_stats: Dict = {}
 
     # ---------------- I/O ----------------
     def _collect_processed_files(self) -> List[str]:
@@ -140,10 +144,9 @@ class RegimeTrainer:
     def load_all_processed(self) -> pd.DataFrame:
         files = self._collect_processed_files()
         parts = []
-        for fp in files:
+        for fp in tqdm(files, desc="Loading processed chunks"):
             self.logger.info(f"Loading processed chunk: {fp}")
             df = pd.read_csv(fp)
-            # prefer scaled columns if present; but we operate on raw features for clustering
             parts.append(df)
         df_all = pd.concat(parts, ignore_index=True)
         self.logger.info(f"Total processed rows loaded: {len(df_all)}")
@@ -180,8 +183,11 @@ class RegimeTrainer:
         n_max = n_max or self.nmax
         best = None
         best_bic = np.inf
+        best_aic = np.inf
+        results = []
+        
         self.logger.info(f"Searching GMM components in [{n_min}, {n_max}] using BIC/AIC")
-        for k in range(n_min, n_max + 1):
+        for k in tqdm(range(n_min, n_max + 1), desc="GMM Component Search"):
             try:
                 g = GaussianMixture(
                     n_components=k,
@@ -194,21 +200,32 @@ class RegimeTrainer:
                 g.fit(X)
                 bic = g.bic(X)
                 aic = g.aic(X)
+                results.append((k, bic, aic))
                 self.logger.info(f"GMM k={k}: BIC={bic:.1f}, AIC={aic:.1f}")
-                # prefer lower BIC primarily
-                if bic < best_bic:
-                    best_bic = bic
-                    best = (g, bic, aic)
+                
+                # Prefer models closer to target regime count
+                regime_distance = abs(k - self.target_regimes)
+                score = bic + (regime_distance * 100)  # Penalize being far from target
+                
+                if score < best_bic:
+                    best_bic = score
+                    best_aic = aic
+                    best = g
             except Exception as e:
                 self.logger.warning(f"GMM k={k} failed: {e}")
+                
         if best is None:
             raise RuntimeError("All GMM fits failed")
-        gmm = best[0]
-        self.logger.info(f"Selected GMM with {gmm.n_components} components (BIC {best[1]:.1f})")
-        self.gmm = gmm
+            
+        # Save component selection results
+        results_df = pd.DataFrame(results, columns=["n_components", "bic", "aic"])
+        results_df.to_csv(self.model_dir / "gmm_component_selection.csv", index=False)
+        
+        self.logger.info(f"Selected GMM with {best.n_components} components (BIC {best_bic:.1f}, AIC {best_aic:.1f})")
+        self.gmm = best
         joblib.dump(self.gmm, self.model_dir / "gmm_model.pkl")
         self.logger.info("Saved gmm_model.pkl")
-        return gmm
+        return best
 
     # ---------------- Build regime assignments ----------------
     def assign_regimes(self, gmm: GaussianMixture, X_scaled: np.ndarray, df_meta: pd.DataFrame) -> pd.DataFrame:
@@ -216,17 +233,67 @@ class RegimeTrainer:
         probs = gmm.predict_proba(X_scaled)
         labels = probs.argmax(axis=1)
         confidences = probs.max(axis=1)
+        
+        # Calculate regime durations and filter short regimes
+        filtered_labels = self._filter_short_regimes(labels)
+        
         df_out = pd.DataFrame({
             "timestamp": df_meta["timestamp"].values,
             "datetime_ist": df_meta["datetime_ist"].values if "datetime_ist" in df_meta.columns else None,
-            "regime": labels,
-            "regime_confidence": confidences
+            "regime": filtered_labels,
+            "regime_confidence": confidences,
+            "regime_name": [REGIME_MAPPING.get(l, f"UNKNOWN_{l}") for l in filtered_labels]
         })
+        
+        # Calculate regime statistics
+        self._calculate_regime_statistics(df_out, df_meta)
+        
         # Save assignments
         out_fp = self.model_dir / "regime_assignments.csv"
         df_out.to_csv(out_fp, index=False)
         self.logger.info(f"Saved regime assignments -> {out_fp} ({df_out.shape[0]} rows)")
         return df_out
+
+    def _filter_short_regimes(self, labels: np.ndarray) -> np.ndarray:
+        """Filter out regimes that are too short to be meaningful"""
+        filtered = labels.copy()
+        current_regime = labels[0]
+        start_idx = 0
+        
+        for i in range(1, len(labels)):
+            if labels[i] != current_regime:
+                duration = i - start_idx
+                if duration < self.min_regime_duration:
+                    # Mark short regime for filtering (assign previous regime)
+                    filtered[start_idx:i] = labels[start_idx-1] if start_idx > 0 else labels[i]
+                
+                current_regime = labels[i]
+                start_idx = i
+        
+        # Check last regime
+        duration = len(labels) - start_idx
+        if duration < self.min_regime_duration and start_idx > 0:
+            filtered[start_idx:] = labels[start_idx-1]
+            
+        return filtered
+
+    def _calculate_regime_statistics(self, df_assignments: pd.DataFrame, df_meta: pd.DataFrame):
+        """Calculate statistics for each regime"""
+        stats = {}
+        for regime in df_assignments["regime"].unique():
+            regime_mask = df_assignments["regime"] == regime
+            stats[regime] = {
+                "count": int(regime_mask.sum()),
+                "duration_avg": float(regime_mask.groupby((regime_mask != regime_mask.shift()).cumsum()).sum().mean()),
+                "confidence_avg": float(df_assignments.loc[regime_mask, "regime_confidence"].mean()),
+                "volatility_avg": float(df_meta.loc[regime_mask, "volatility"].mean()) if "volatility" in df_meta.columns else None,
+                "returns_avg": float(df_meta.loc[regime_mask, "returns"].mean()) if "returns" in df_meta.columns else None,
+            }
+        
+        self.regime_stats = stats
+        stats_df = pd.DataFrame.from_dict(stats, orient="index")
+        stats_df.to_csv(self.model_dir / "regime_statistics.csv", index_label="regime")
+        self.logger.info("Saved regime statistics")
 
     # ---------------- HMM training ----------------
     def fit_hmm(self, X_scaled: np.ndarray, n_components: Optional[int] = None) -> GaussianHMM:
@@ -234,7 +301,9 @@ class RegimeTrainer:
             if self.gmm is None:
                 raise RuntimeError("GMM must be trained before HMM initialization to choose n_components")
             n_components = self.gmm.n_components
+            
         self.logger.info(f"Initializing HMM with {n_components} states (Baum-Welch)")
+        
         # Initialize HMM parameters using GMM if available
         try:
             # Create HMM and set means/covars from GMM for fast convergence
@@ -243,14 +312,16 @@ class RegimeTrainer:
                 covariance_type=self.covariance_type,
                 n_iter=self.hmm_max_iter,
                 tol=self.hmm_tol,
-                verbose=False,
+                verbose=True,  # Enable verbose output for monitoring
                 random_state=self.random_state,
             )
-            # set startprob uniformly, transmat random (will be re-estimated)
+            
+            # Set startprob uniformly, transmat random (will be re-estimated)
             startprob = np.full(n_components, 1.0 / n_components)
             transmat = np.full((n_components, n_components), 1.0 / n_components)
             hmm.startprob_ = startprob
             hmm.transmat_ = transmat
+            
             # Initialize means/covars by splitting GMM means to HMM (if available)
             if self.gmm is not None:
                 try:
@@ -270,6 +341,7 @@ class RegimeTrainer:
                         pass
                 except Exception as e:
                     self.logger.warning(f"Failed to initialize HMM means/covars from GMM: {e}")
+            
             # Fit HMM on full sequence (Baum-Welch)
             self.logger.info("Fitting HMM (this may take a while)...")
             hmm.fit(X_scaled)
@@ -277,6 +349,7 @@ class RegimeTrainer:
             joblib.dump(self.hmm, self.model_dir / "hmm_model.pkl")
             self.logger.info("Saved hmm_model.pkl")
             return hmm
+            
         except Exception as e:
             self.logger.error(f"HMM training failed: {e}\n{traceback.format_exc()}")
             raise
@@ -285,15 +358,25 @@ class RegimeTrainer:
     def compute_transition_matrix(self, assignments: pd.DataFrame, n_states: int) -> pd.DataFrame:
         seq = assignments["regime"].values.astype(int)
         counts = np.zeros((n_states, n_states), dtype=float)
+        
         for (a, b) in zip(seq[:-1], seq[1:]):
             counts[a, b] += 1
+        
         # Laplace smoothing to avoid zeros
         counts += 1e-6
         probs = counts / counts.sum(axis=1, keepdims=True)
+        
         rows = []
         for i in range(n_states):
             for j in range(n_states):
-                rows.append({"from_regime": int(i), "to_regime": int(j), "prob": float(probs[i, j])})
+                rows.append({
+                    "from_regime": int(i),
+                    "from_regime_name": REGIME_MAPPING.get(i, f"UNKNOWN_{i}"),
+                    "to_regime": int(j),
+                    "to_regime_name": REGIME_MAPPING.get(j, f"UNKNOWN_{j}"),
+                    "prob": float(probs[i, j])
+                })
+                
         dfp = pd.DataFrame(rows)
         dfp.to_csv(self.model_dir / "transition_probs.csv", index=False)
         self.logger.info(f"Saved transition probabilities -> {self.model_dir / 'transition_probs.csv'}")
@@ -312,30 +395,65 @@ class RegimeTrainer:
         self.logger.info("Running TimeSeriesSplit stability checks (GMM)")
         tscv = TimeSeriesSplit(n_splits=self.n_splits)
         label_changes = []
-        for train_idx, test_idx in tscv.split(X):
+        
+        for fold, (train_idx, test_idx) in enumerate(tscv.split(X), 1):
             try:
-                g = GaussianMixture(n_components=self.gmm.n_components, covariance_type=self.covariance_type, reg_covar=self.reg_covar, random_state=self.random_state)
+                g = GaussianMixture(
+                    n_components=self.gmm.n_components, 
+                    covariance_type=self.covariance_type, 
+                    reg_covar=self.reg_covar, 
+                    random_state=self.random_state
+                )
                 g.fit(X[train_idx])
                 labels_train = g.predict(X[train_idx])
                 labels_test = g.predict(X[test_idx])
-                # simple stability: ratio of most frequent label overlap
-                # (not perfect but gives signal)
-                label_changes.append(float(np.mean(labels_test == labels_test)))
+                
+                # Calculate stability metrics
+                train_stability = self._calculate_regime_stability(labels_train)
+                test_stability = self._calculate_regime_stability(labels_test)
+                
+                label_changes.append({
+                    "fold": fold,
+                    "train_stability": train_stability,
+                    "test_stability": test_stability
+                })
+                
+                self.logger.info(f"Fold {fold}: Train stability={train_stability:.3f}, Test stability={test_stability:.3f}")
+                
             except Exception as e:
                 self.logger.warning(f"CV fold GMM failed: {e}")
+                
+        # Save CV results
+        cv_df = pd.DataFrame(label_changes)
+        cv_df.to_csv(self.model_dir / "cv_stability_results.csv", index=False)
+        
         self.logger.info(f"GMM CV completed ({len(label_changes)} folds)")
         return label_changes
+
+    def _calculate_regime_stability(self, labels_series):
+        """Calculate regime persistence metrics"""
+        if len(labels_series) < 2:
+            return 1.0
+            
+        changes = np.diff(labels_series)
+        stability = 1.0 - (np.sum(changes != 0) / len(changes))
+        return stability
 
     # ---------------- Main runner ----------------
     def run(self):
         start_all = time.time()
         try:
+            # Load and prepare data
             df_all = self.load_all_processed()
             X_scaled, df_meta = self.prepare_features(df_all)
             self.monitor_feature_drift(X_scaled)
 
             # GMM search & fit
             gmm = self.select_and_fit_gmm(X_scaled)
+            
+            # Cross-validation stability check
+            self.time_series_cv_gmm_stability(X_scaled)
+            
             # assignments and save
             assignments = self.assign_regimes(gmm, X_scaled, df_meta)
 
@@ -345,7 +463,7 @@ class RegimeTrainer:
             # compute transition probabilities (from GMM labels as baseline)
             trans_df = self.compute_transition_matrix(assignments, n_states=gmm.n_components)
 
-            # Save manifest
+            # Save manifest with enhanced information
             manifest = {
                 "n_rows": int(df_all.shape[0]),
                 "n_features": int(X_scaled.shape[1]),
@@ -354,14 +472,19 @@ class RegimeTrainer:
                 "hmm_n_components": int(hmm.n_components) if hmm else None,
                 "hmm_tol": float(self.hmm_tol),
                 "hmm_max_iter": int(self.hmm_max_iter),
+                "regime_stats": {str(k): v for k, v in self.regime_stats.items()},
+                "regime_mapping": REGIME_MAPPING,
                 "timestamp_utc": int(time.time()),
+                "training_duration_seconds": float(time.time() - start_all),
             }
+            
             with open(self.manifest_name, "w") as mf:
                 json.dump(manifest, mf, indent=2)
             self.logger.info(f"Saved manifest -> {self.manifest_name}")
 
             total_time = time.time() - start_all
             self.logger.info(f"RegimeTrainer completed successfully in {total_time:.2f}s")
+            
         except Exception as e:
             self.logger.error(f"RegimeTrainer failed: {e}\n{traceback.format_exc()}")
             raise
@@ -384,6 +507,8 @@ def parse_args():
     p.add_argument("--random_state", type=int, default=42)
     p.add_argument("--log_path", default="logs/regime_trainer.log")
     p.add_argument("--manifest_name", default="models/manifest_regime.json")
+    p.add_argument("--min_regime_duration", type=int, default=5, help="Minimum candles for a regime to be valid")
+    p.add_argument("--target_regimes", type=int, default=8, help="Target number of regimes to identify")
     return p.parse_args()
 
 
@@ -403,5 +528,7 @@ if __name__ == "__main__":
         random_state=args.random_state,
         log_path=args.log_path,
         manifest_name=args.manifest_name,
+        min_regime_duration=args.min_regime_duration,
+        target_regimes=args.target_regimes,
     )
     trainer.run()
