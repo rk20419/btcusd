@@ -1,24 +1,3 @@
-"""
-Production-grade Module 1 Part B: Live Data Engine Predictor
-
-Features:
-- Loads live CSV (Binance 1m candles) and computes the same features as trainer.
-- Loads canonical scaler and top-features (with safe fallbacks).
-- Robust null handling (ffill/bfill/interpolate) + fast iterative imputer fallback.
-- Produces processed file with raw + scaled features: processed/live/live_features.csv
-- Optional Prometheus metrics if prometheus_client is installed.
-- Health file (processed/live/health.json) updated on success.
-- CLI supports `--once` for single-run mode and configuration overrides.
-- Dynamic volatility adjustment for exponential weighting
-- Enhanced health monitoring with volatility factor and feature coverage
-- Additional Prometheus metrics for better observability
-- Configuration validation for robust operation
-
-Notes:
-- Ensure dependencies installed: pandas, numpy, ta, scikit-learn, tqdm (optional), prometheus_client (optional)
-- Designed to be container-friendly and safe for production.
-"""
-
 from __future__ import annotations
 
 import argparse
@@ -28,8 +7,9 @@ import pickle
 import sys
 import time
 import traceback
+import gc
 from pathlib import Path
-from typing import List, Optional, Tuple, Dict, Any
+from typing import List, Optional, Tuple, Dict, Any, Union
 
 import numpy as np
 import pandas as pd
@@ -39,10 +19,11 @@ import ta
 from sklearn.preprocessing import MinMaxScaler
 from sklearn.experimental import enable_iterative_imputer  # noqa: F401
 from sklearn.impute import IterativeImputer, KNNImputer
+from sklearn.feature_selection import mutual_info_regression
 
 # optional prometheus metrics
 try:
-    from prometheus_client import Gauge, start_http_server  # type: ignore
+    from prometheus_client import Gauge, start_http_server, Counter  # type: ignore
     PROM_AVAILABLE = True
 except Exception:
     PROM_AVAILABLE = False
@@ -55,13 +36,22 @@ except Exception:
 
 # Constants
 REQUIRED_COLS = {
-    "timestamp", "open", "high", "low", "close",
-    "volume", "quote_volume", "trades",
-    "taker_buy_base", "taker_buy_quote"
+    "datetime_ist", "open", "high", "low", "close",
+    "volume", "quote_volume", "trades", "taker_buy_base", "taker_buy_quote"
 }
 EPS = 1e-10
 DEFAULT_TOP_K = 15
 HEALTH_FILE = "processed/live/health.json"
+
+# Predefined features from trainer
+PREDEFINED_FEATURES = [
+    "rsi_14", "macd", "macd_signal", "obv", "atr_14", "momentum_5",
+    "taker_buy_ratio", "volume_spike_5", "large_trade_ratio",
+    "session_asia", "session_london", "session_ny",
+    "bullish_engulfing", "doji", "hammer", "shooting_star", "hidden_divergence",
+    "weighted_rsi", "weighted_volume",
+    "realized_vol_30", "garman_klass_30", "parkinson_30"
+]
 
 # -------------------------
 # Logger
@@ -98,7 +88,7 @@ class DataEnginePredictor:
         output_path: str = "processed/live/live_features.csv",
         scaler_path: str = "scalers/scaler_canonical.pkl",
         feature_importance_path: str = "processed/feature_importance.csv",
-        top_features_path: Optional[str] = None,  # alternative: processed/top_features.txt
+        top_features_path: Optional[str] = None,
         log_path: str = "logs/data_engine_predictor.log",
         missing_threshold: float = 0.05,
         exp_lookback: int = 50,
@@ -108,6 +98,9 @@ class DataEnginePredictor:
         prometheus_port: Optional[int] = None,
         fallback_use_identity_scaler: bool = True,
         volatility_adjustment: bool = True,
+        n_features: int = 15,
+        mse_threshold: float = 0.1,
+        version: str = "1.0.1",
     ):
         self.live_data_path = Path(live_data_path)
         self.output_path = Path(output_path)
@@ -121,6 +114,9 @@ class DataEnginePredictor:
         self.prometheus_port = prometheus_port
         self.fallback_use_identity_scaler = fallback_use_identity_scaler
         self.volatility_adjustment = volatility_adjustment
+        self.n_features = n_features
+        self.mse_threshold = mse_threshold
+        self.version = version
         self.volatility_factor = 1.0
 
         # Validate configuration
@@ -137,6 +133,8 @@ class DataEnginePredictor:
         self.last_good_df: Optional[pd.DataFrame] = None
         self.last_latency = None
         self.last_processed_ts: Optional[int] = None
+        self.processed_count = 0
+        self.error_count = 0
 
         # prom counters
         if PROM_AVAILABLE and self.prometheus_port:
@@ -153,18 +151,21 @@ class DataEnginePredictor:
             self.gauge_processed_rows = Gauge("data_engine_processed_rows", "Rows processed in last run")
             self.gauge_volatility_factor = Gauge("data_engine_volatility_factor", "Current volatility adjustment factor")
             self.gauge_feature_coverage = Gauge("data_engine_feature_coverage", "Percentage of top features available")
+            self.counter_processed = Counter("data_engine_processed_total", "Total processing cycles")
+            self.counter_errors = Counter("data_engine_errors_total", "Total processing errors")
         else:
             self.gauge_latency = self.gauge_null_frac = self.gauge_processed_rows = None
             self.gauge_volatility_factor = self.gauge_feature_coverage = None
-
-        # load scaler & feature list
-        self.scaler: Optional[MinMaxScaler] = None
-        self.top_features: List[str] = []
-        self._load_artifacts(exp_lookback, DEFAULT_TOP_K)
+            self.counter_processed = self.counter_errors = None
 
         # exponential weights
         self.exp_weights = np.exp(np.linspace(-1, 0, exp_lookback))
         self.exp_weights /= self.exp_weights.sum()
+
+        # load scaler & feature list
+        self.scaler: Optional[MinMaxScaler] = None
+        self.top_features: List[str] = []
+        self._load_artifacts(exp_lookback, n_features)
 
         # watch file mtime
         self.last_mtime = self.live_data_path.stat().st_mtime if self.live_data_path.exists() else 0
@@ -222,14 +223,8 @@ class DataEnginePredictor:
                 raise FileNotFoundError("Feature importance not found")
         except Exception as e:
             self.logger.warning(f"Failed to load feature importance: {e}")
-            # fallback to a reasonable default (a superset of trainer features)
-            fallback_list = [
-                "rsi_14", "atr_14", "taker_buy_ratio", "obv",
-                "volume_spike_5", "momentum_5", "bb_width", "macd",
-                "weighted_rsi_14" if exp_lookback > 1 else "rsi_14",
-                "weighted_volume"
-            ]
-            self.top_features = [f for f in fallback_list if f in fallback_list][:default_k]
+            # fallback to predefined from trainer
+            self.top_features = PREDEFINED_FEATURES[:default_k]
             self.logger.warning(f"Falling back to default top features: {self.top_features}")
 
         if not self.top_features:
@@ -239,20 +234,58 @@ class DataEnginePredictor:
     # -------------------------
     # Utilities
     # -------------------------
-    def _exp_weighted(self, arr: np.ndarray, weights: np.ndarray) -> float:
+    def _downcast_numeric(self, df: pd.DataFrame) -> pd.DataFrame:
+        for col in df.select_dtypes(include=["float"]).columns:
+            df[col] = pd.to_numeric(df[col], downcast="float")
+        for col in df.select_dtypes(include=["integer"]).columns:
+            df[col] = pd.to_numeric(df[col], downcast="integer")
+        return df
+
+    def _exp_weighted(self, arr: np.ndarray) -> float:
         n = len(arr)
-        w = weights[-n:]
+        w = self.exp_weights[-n:]
         return float(np.dot(arr, w)) if n else np.nan
 
+    # ---------- Volatility estimators ----------
+    @staticmethod
+    def realized_volatility(log_returns: pd.Series, window: int) -> pd.Series:
+        # realized volatility: sqrt(sum(ret^2)) over window
+        return np.sqrt(log_returns.pow(2).rolling(window).sum())
+
+    @staticmethod
+    def garman_klass(high: pd.Series, low: pd.Series, close: pd.Series, window: int) -> pd.Series:
+        # Continuous variant of Garman-Klass estimator (variance), return sqrt to get vol
+        rs = (high / low).apply(np.log)
+        ks = (close / ((high + low) / 2)).apply(np.log)  # approximate
+        var = (0.5 * rs.pow(2) - (2 * np.log(2) - 1) * ks.pow(2)).rolling(window).mean()
+        var = var.clip(lower=EPS)
+        return np.sqrt(var)
+
+    @staticmethod
+    def parkinson(high: pd.Series, low: pd.Series, window: int) -> pd.Series:
+        # Parkinson (1980) estimator
+        rs = (high / low).apply(np.log)
+        var = (1.0 / (4.0 * np.log(2))) * rs.pow(2).rolling(window).mean()
+        var = var.clip(lower=EPS)
+        return np.sqrt(var)
+
     def _calculate_volatility_factor(self, df: pd.DataFrame) -> float:
-        """Calculate dynamic volatility adjustment factor"""
+        """Calculate dynamic volatility adjustment factor matching trainer logic"""
         if len(df) < 100:
             return 1.0
         try:
-            recent_volatility = df['high'].tail(100) - df['low'].tail(100)
-            vol_mean = recent_volatility.mean()
-            # Normalize to typical BTC volatility (adjust based on market)
-            return max(0.5, min(2.0, vol_mean / 100))
+            df["log_ret"] = np.log(df["close"]).diff()
+            rv30 = self.realized_volatility(df["log_ret"].fillna(0.0), 30)
+            q = max(0.01, min(0.99, 0.75))
+            rv_q = np.nanquantile(rv30.replace(0, np.nan).dropna(), q)
+            baseline = rv_q if not np.isnan(rv_q) else (rv30.mean() if len(rv30.dropna()) > 0 else 0.001)
+            volatility_multiplier = float(np.clip(20 + 200 * baseline, 10, 200))
+
+            high_low_range = (df['high'] - df['low']).tail(100)
+            price_volatility = high_low_range.mean() / df['close'].iloc[-1]
+            returns_volatility = df['close'].pct_change().tail(100).std()
+            normalized_volatility = max(price_volatility, returns_volatility, baseline)
+            return max(0.5, min(3.0, normalized_volatility * volatility_multiplier))
         except Exception as e:
             self.logger.warning(f"Volatility factor calculation failed: {e}")
             return 1.0
@@ -263,129 +296,151 @@ class DataEnginePredictor:
     def load_live_data(self) -> pd.DataFrame:
         if not self.live_data_path.exists():
             raise FileNotFoundError(f"Live data file not found: {self.live_data_path}")
+        
+        self.logger.info(f"Loading data from {self.live_data_path}")
         df = pd.read_csv(self.live_data_path)
+
+        assert "datetime_ist" in df.columns, "datetime_ist column is missing from input data"
+        df["datetime"] = pd.to_datetime(df["datetime_ist"], format="%Y-%m-%d %H:%M:%S")
+        
         missing = REQUIRED_COLS - set(df.columns)
         if missing:
-            raise ValueError(f"Missing required cols in live CSV: {missing}")
+            raise ValueError(f"Missing required columns: {missing}")
+            
+        if (df[["open", "high", "low", "close"]] <= 0).any().any():
+            raise ValueError("Non-positive prices detected")
+
+        df = df.sort_values("datetime").reset_index(drop=True)
+        df = self._downcast_numeric(df)
+        self.logger.info(f"Loaded {len(df)} rows successfully")
         return df
 
-    def handle_nulls_core(self, df: pd.DataFrame) -> pd.DataFrame:
-        core_cols = [
-            "open", "high", "low", "close",
-            "volume", "quote_volume", "trades",
-            "taker_buy_base", "taker_buy_quote",
-        ]
-        # forward/backward fill + interpolate for small gaps
-        df[core_cols] = df[core_cols].ffill().bfill().interpolate(limit_direction="both")
-        frac = df[core_cols].isnull().mean().max()
-        if frac > self.missing_threshold:
-            self.logger.warning(f"High null fraction in core: {frac:.2%} > {self.missing_threshold*100:.1f}%")
-        return df
+    def handle_nulls(self, df: pd.DataFrame, phase: str = "basic") -> pd.DataFrame:
+        try:
+            self.logger.info(f"Handling nulls ({phase})")
+            core_cols = [
+                "open", "high", "low", "close",
+                "volume", "quote_volume", "trades",
+                "taker_buy_base", "taker_buy_quote",
+            ]
+            if phase == "basic":
+                df[core_cols] = df[core_cols].ffill().bfill().interpolate(limit_direction="both")
+                null_frac = df[core_cols].isnull().mean()
+                if null_frac.any():
+                    self.logger.warning(f"Core null fractions after fill: {null_frac.to_dict()}")
+            else:
+                num_cols = df.select_dtypes(include=[np.number]).columns
+                if df[num_cols].isnull().any().any():
+                    imputer = IterativeImputer(random_state=42, max_iter=10, initial_strategy="median")
+                    df[num_cols] = pd.DataFrame(imputer.fit_transform(df[num_cols]), columns=num_cols, index=df.index)
+            null_frac_all = df.isnull().mean()
+            drop_cols = null_frac_all[null_frac_all > self.missing_threshold].index.tolist()
+            if drop_cols:
+                self.logger.warning(
+                    f"Dropping columns with >{self.missing_threshold*100:.1f}% nulls: {drop_cols}"
+                )
+                df = df.drop(columns=drop_cols)
+            return df
+        except Exception as e:
+            self.logger.error(f"Null handling error: {e}")
+            raise
 
     # -------------------------
     # Feature calculation (safe)
     # -------------------------
     def calculate_features(self, df: pd.DataFrame) -> pd.DataFrame:
-        # Calculate volatility factor for dynamic weighting
-        if self.volatility_adjustment:
-            self.volatility_factor = self._calculate_volatility_factor(df)
-            self.logger.info(f"Volatility factor calculated: {self.volatility_factor:.3f}")
-
-        # Ensure datetime columns
-        df = df.copy()
-        df["datetime"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True)
-        df["datetime_ist"] = df["datetime"].dt.tz_convert("Asia/Kolkata").dt.strftime("%Y-%m-%d %H:%M:%S")
-
-        # base
-        df["returns"] = df["close"].pct_change()
-        df["volatility"] = df["high"] - df["low"]
-
-        # Protected TA calculations (each wrapped)
-        def safe_assign(col_name: str, func):
-            try:
-                df[col_name] = func()
-            except Exception as e:
-                self.logger.warning(f"Indicator {col_name} failed: {e}")
-                df[col_name] = np.nan
-
-        safe_assign("rsi_14", lambda: ta.momentum.RSIIndicator(df["close"], window=14).rsi())
-        safe_assign("macd", lambda: ta.trend.MACD(df["close"]).macd())
-        safe_assign("macd_signal", lambda: ta.trend.MACD(df["close"]).macd_signal())
-        safe_assign("obv", lambda: ta.volume.OnBalanceVolumeIndicator(df["close"], df["volume"]).on_balance_volume())
-        safe_assign("atr_14", lambda: ta.volatility.AverageTrueRange(df["high"], df["low"], df["close"], window=14).average_true_range())
-        safe_assign("momentum_5", lambda: ta.momentum.ROCIndicator(df["close"], window=5).roc())
-        safe_assign("mfi_14", lambda: ta.volume.MFIIndicator(df["high"], df["low"], df["close"], df["volume"], window=14).money_flow_index())
-
-        # Stochastic
         try:
-            stoch = ta.momentum.StochasticOscillator(df["high"], df["low"], df["close"], window=14, smooth_window=3)
-            df["stoch_k"] = stoch.stoch()
-            df["stoch_d"] = stoch.stoch_signal()
-        except Exception as e:
-            self.logger.warning(f"Stochastic failed: {e}")
-            df["stoch_k"] = np.nan
-            df["stoch_d"] = np.nan
+            self.logger.info("Calculating features...")
 
-        # EMAs / Bollinger
-        safe_assign("ema_9", lambda: ta.trend.EMAIndicator(df["close"], window=9).ema_indicator())
-        safe_assign("ema_21", lambda: ta.trend.EMAIndicator(df["close"], window=21).ema_indicator())
-        try:
-            bb = ta.volatility.BollingerBands(df["close"], window=20, window_dev=2)
-            df["bb_width"] = (bb.bollinger_hband() - bb.bollinger_lband()) / (df["close"] + EPS)
-        except Exception as e:
-            self.logger.warning(f"Bollinger failed: {e}")
-            df["bb_width"] = np.nan
+            # Calculate volatility factor for dynamic weighting
+            if self.volatility_adjustment:
+                self.volatility_factor = self._calculate_volatility_factor(df)
+                self.logger.info(f"Volatility factor calculated: {self.volatility_factor:.3f}")
 
-        # Microstructure
-        df["taker_buy_ratio"] = df["taker_buy_base"] / (df["volume"] + EPS)
-        df["volume_spike_5"] = df["volume"] / (df["volume"].rolling(5).mean().replace(0, EPS) + EPS)
-        trades_roll_std = df["trades"].rolling(5).std().fillna(0.0)
-        trades_roll_mean = df["trades"].rolling(5).mean().replace(0, EPS)
-        df["large_trade_ratio"] = trades_roll_std / trades_roll_mean
+            df["returns"] = df["close"].pct_change()
+            df["log_ret"] = np.log(df["close"]).diff()
+            df["volatility"] = df["high"] - df["low"]
 
-        # Sessions (IST)
-        df["hour_ist"] = pd.to_datetime(df["datetime_ist"]).dt.hour
-        df["session_asia"] = ((df["hour_ist"] >= 0) & (df["hour_ist"] < 8)).astype(int)
-        df["session_london"] = ((df["hour_ist"] >= 8) & (df["hour_ist"] < 16)).astype(int)
-        df["session_ny"] = ((df["hour_ist"] >= 16) & (df["hour_ist"] <= 23)).astype(int)
-
-        # Price action flags
-        df["bullish_engulfing"] = (
-            (df["close"] > df["open"]) &
-            (df["close"].shift(1) < df["open"].shift(1)) &
-            (df["close"] > df["open"].shift(1)) &
-            (df["open"] < df["close"].shift(1))
-        ).astype(int)
-
-        df["price_low_14"] = df["low"].rolling(14).min()
-        df["rsi_low_14"] = df["rsi_14"].rolling(14).min()
-        df["hidden_divergence"] = (
-            (df["low"] > df["price_low_14"].shift(1)) &
-            (df["rsi_14"] < df["rsi_low_14"].shift(1))
-        ).astype(int)
-
-        # Exponentially weighted variants with volatility adjustment
-        window_len = len(self.exp_weights)
-        for c in ["rsi_14", "volume", "returns", "volatility"]:
-            if c in df.columns:
+            # TA features
+            def safe_assign(col_name: str, func):
                 try:
-                    # Apply volatility adjustment to weights if enabled
-                    if self.volatility_adjustment:
-                        weight_factor = self.volatility_factor
-                        adjusted_weights = self.exp_weights ** weight_factor
-                        adjusted_weights /= adjusted_weights.sum()
-                    else:
-                        adjusted_weights = self.exp_weights
-                    
-                    df[f"weighted_{c}"] = (
-                        df[c].rolling(window_len, min_periods=1)
-                        .apply(lambda x: self._exp_weighted(np.asarray(x, dtype=float), adjusted_weights), raw=False)
-                    )
+                    df[col_name] = func()
                 except Exception as e:
-                    self.logger.warning(f"Weighted {c} failed: {e}")
-                    df[f"weighted_{c}"] = np.nan
+                    self.logger.warning(f"Indicator {col_name} failed: {e}")
+                    df[col_name] = np.nan
 
-        return df
+            safe_assign("rsi_14", lambda: ta.momentum.RSIIndicator(df["close"], window=14).rsi())
+            safe_assign("macd", lambda: ta.trend.MACD(df["close"]).macd())
+            safe_assign("macd_signal", lambda: ta.trend.MACD(df["close"]).macd_signal())
+            safe_assign("obv", lambda: ta.volume.OnBalanceVolumeIndicator(df["close"], df["volume"]).on_balance_volume())
+            safe_assign("atr_14", lambda: ta.volatility.AverageTrueRange(df["high"], df["low"], df["close"], window=14).average_true_range())
+            safe_assign("momentum_5", lambda: ta.momentum.ROCIndicator(df["close"], window=5).roc())
+
+            # Microstructure / order-flow proxies
+            df["taker_buy_ratio"] = df["taker_buy_base"] / (df["volume"] + EPS)
+            df["volume_spike_5"] = df["volume"] / (df["volume"].rolling(5).mean().replace(0, EPS) + EPS)
+            trades_roll_std = df["trades"].rolling(5).std().fillna(0.0)
+            trades_roll_mean = df["trades"].rolling(5).mean().replace(0, EPS)
+            df["large_trade_ratio"] = trades_roll_std / trades_roll_mean
+
+            # Sessions (IST based)
+            df["hour_ist"] = df["datetime"].dt.hour
+            df["weekday"] = df["datetime"].dt.weekday
+            df["session_asia"] = ((df["hour_ist"] >= 0) & (df["hour_ist"] < 8)).astype(int)
+            df["session_london"] = ((df["hour_ist"] >= 8) & (df["hour_ist"] < 16)).astype(int)
+            df["session_ny"] = ((df["hour_ist"] >= 16) & (df["hour_ist"] <= 23)).astype(int)
+
+            # Extended candlestick patterns
+            # Bullish Engulfing
+            df["bullish_engulfing"] = (
+                (df["close"] > df["open"]) &
+                (df["close"].shift(1) < df["open"].shift(1)) &
+                (df["close"] > df["open"].shift(1)) &
+                (df["open"] < df["close"].shift(1))
+            ).astype(int)
+
+            # Doji
+            df["doji"] = ( (df["close"] - df["open"]).abs() <= (df["high"] - df["low"]) * 0.1 ).astype(int)
+
+            # Hammer / Hanging man (simple)
+            body = (df["close"] - df["open"]).abs()
+            lower_shadow = df["open"].where(df["close"]>=df["open"], df["close"]) - df["low"]
+            df["hammer"] = ((lower_shadow > 2 * body) & (body <= (df["high"] - df["low"]) * 0.3)).astype(int)
+
+            # Shooting Star
+            upper_shadow = df["high"] - df["close"].where(df["close"]>=df["open"], df["open"])
+            df["shooting_star"] = ((upper_shadow > 2 * body) & (body <= (df["high"] - df["low"]) * 0.3)).astype(int)
+
+            # Hidden divergence
+            df["price_low_14"] = df["low"].rolling(14).min()
+            df["rsi_low_14"] = df["rsi_14"].rolling(14).min()
+            df["hidden_divergence"] = (
+                (df["low"] > df["price_low_14"].shift(1)) &
+                (df["rsi_14"] < df["rsi_low_14"].shift(1))
+            ).astype(int)
+
+            # Realized / GK / Parkinson volatility over 30-periods (1m -> 30m)
+            df["realized_vol_30"] = self.realized_volatility(df["log_ret"].fillna(0.0), 30)
+            df["garman_klass_30"] = self.garman_klass(df["high"], df["low"], df["close"], 30)
+            df["parkinson_30"] = self.parkinson(df["high"], df["low"], 30)
+
+            # Exponentially weighted variants with volatility adjustment
+            for c in ["rsi_14", "volume"]:
+                if c in df.columns:
+                    weight_factor = self.volatility_factor if self.volatility_adjustment else 1.0
+                    adjusted_weights = self.exp_weights ** weight_factor
+                    adjusted_weights /= adjusted_weights.sum()
+
+                    df[f"weighted_{c}"] = (
+                        df[c].rolling(len(adjusted_weights), min_periods=1)
+                        .apply(lambda x: self._exp_weighted(x) if len(x) > 0 else np.nan, raw=False)
+                    )
+
+            self.logger.info(f"Generated {len(df.columns)} columns (features + base)")
+            return df
+        except Exception as e:
+            self.logger.error(f"Feature calculation error: {e}")
+            raise
 
     # -------------------------
     # Post-feature impute/validation
@@ -460,7 +515,7 @@ class DataEnginePredictor:
         X_scaled = np.clip(X_scaled, self.clip_lo, self.clip_hi)
 
         # Build output
-        out = df[["timestamp", "datetime_ist"]].copy()
+        out = df[["datetime_ist"]].copy()
         for i, col in enumerate(self.top_features):
             out[col] = df[col].values
         if self.save_scaled:
@@ -478,9 +533,9 @@ class DataEnginePredictor:
             rows = len(df)
             self.logger.info(f"Loaded live data ({rows} rows) from {self.live_data_path}")
 
-            df = self.handle_nulls_core(df)
+            df = self.handle_nulls(df, phase="basic")
             df = self.calculate_features(df)
-            df = self.impute_post_features(df)
+            df = self.handle_nulls(df, phase="post_feat")
             out_df = self.normalize_features(df)
 
             # Calculate feature coverage for monitoring
@@ -496,7 +551,8 @@ class DataEnginePredictor:
             latency = time.time() - start_t
             self.last_latency = latency
             self.last_good_df = out_df
-            self.last_processed_ts = int(df["timestamp"].iat[-1]) if "timestamp" in df.columns else None
+            self.last_processed_ts = int(df["datetime"].max().timestamp()) if "datetime" in df.columns else None
+            self.processed_count += 1
 
             # update health file
             self._write_health(success=True, latency=latency, rows=rows, feature_coverage=feature_coverage)
@@ -514,6 +570,8 @@ class DataEnginePredictor:
                     self.gauge_volatility_factor.set(float(self.volatility_factor))
                 if self.gauge_feature_coverage:
                     self.gauge_feature_coverage.set(float(feature_coverage))
+                if self.counter_processed:
+                    self.counter_processed.inc()
 
             self.logger.info(f"Processed & saved live features to {self.output_path} (latency {latency:.3f}s)")
             if latency > 1.0:
@@ -522,6 +580,12 @@ class DataEnginePredictor:
             return True
         except Exception as exc:
             self.logger.error(f"Processing update failed: {exc}\n{traceback.format_exc()}")
+            self.error_count += 1
+            
+            # prometheus metrics
+            if PROM_AVAILABLE and self.counter_errors:
+                self.counter_errors.inc()
+                
             # fallback: persist last good data if exists
             if self.last_good_df is not None:
                 try:
@@ -544,7 +608,10 @@ class DataEnginePredictor:
                 "last_processed_timestamp": int(self.last_processed_ts) if self.last_processed_ts else None,
                 "volatility_factor": float(self.volatility_factor),
                 "feature_coverage": float(feature_coverage) if feature_coverage is not None else 0.0,
+                "processed_count": int(self.processed_count),
+                "error_count": int(self.error_count),
                 "message": message or None,
+                "version": self.version,
             }
             Path(HEALTH_FILE).parent.mkdir(parents=True, exist_ok=True)
             with open(HEALTH_FILE, "w") as hf:
@@ -608,6 +675,9 @@ def parse_args():
     p.add_argument("--fallback_use_identity_scaler", action="store_true", help="Allow identity scaler fallback")
     p.add_argument("--volatility_adjustment", action="store_true", help="Enable dynamic volatility adjustment")
     p.add_argument("--no-volatility_adjustment", dest="volatility_adjustment", action="store_false")
+    p.add_argument("--n_features", type=int, default=15, help="Number of top features to use")
+    p.add_argument("--mse_threshold", type=float, default=0.1, help="MSE threshold for drift detection")
+    p.add_argument("--version", type=str, default="1.0.1", help="Version identifier")
     p.set_defaults(save_scaled=True, fallback_use_identity_scaler=True, volatility_adjustment=True)
     return p.parse_args()
 
@@ -631,5 +701,8 @@ if __name__ == "__main__":
         prometheus_port=args.prometheus_port,
         fallback_use_identity_scaler=args.fallback_use_identity_scaler,
         volatility_adjustment=args.volatility_adjustment,
+        n_features=args.n_features,
+        mse_threshold=args.mse_threshold,
+        version=args.version,
     )
     predictor.run(once=args.once)

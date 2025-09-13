@@ -3,7 +3,7 @@ from datetime import datetime
 
 # 📁 Your timeframe paths
 old_path = {
-    '1m': 'data/historical/BTCUSDT_1m_100.csv',
+    '1m': 'data/historical/BTCUSDT_1m_500.csv',
     
 }
 

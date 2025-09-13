@@ -16,14 +16,13 @@ class Config:
     BASE_URL: str = "https://api.binance.com/api/v3/klines"
     SYMBOL: str = "BTCUSDT"
     TIMEFRAMES: Dict[str, int] = field(default_factory=lambda: {
-        "1m":100
+        "1m":500
     })
     LIMIT: int = 1000  # Max candles per request
     OUTPUT_DIR: str = "data/historical"
     REQUEST_DELAY: float = 0.3
     MAX_RETRIES: int = 5
     TIMEZONE: str = "Asia/Kolkata"  # IST timezone
-    VOLATILITY_WINDOW: int = 10     # Rolling window for volatility %
 
 config = Config()
 
@@ -62,7 +61,7 @@ class DataManager:
             columns_to_save = [
                 "timestamp","open","high","low","close","volume",
                 "quote_volume","trades","taker_buy_base","taker_buy_quote",
-                "volatility","datetime_ist"
+                "datetime_ist"
                 ]
             df[columns_to_save].to_csv(filename, index=False)
             logger.info(f"Saved {len(df)} candles to {filename}")
@@ -79,19 +78,8 @@ class DataProcessor:
         return all(len(candle) == 12 for candle in data)
 
     @staticmethod
-    def calculate_volatility(df: pd.DataFrame, period: int = config.VOLATILITY_WINDOW) -> pd.Series:
-        """
-        Calculate volatility (%) as rolling std deviation of returns * 100
-        Same as in stream/websocket_client.py
-        """
-        prices = df["close"]
-        returns = prices.pct_change().fillna(0)
-        vol = returns.rolling(window=period, min_periods=1).std() * 100
-        return vol.fillna(0.0).round(5)
-
-    @staticmethod
     def process_klines(data: List[List[Any]], timeframe: str) -> pd.DataFrame:
-        """Convert raw klines to standardized format + volatility, matching stream output"""
+        """Convert raw klines to standardized format matching stream output"""
         if not DataProcessor.validate_klines(data):
             raise ValueError("Invalid kline data structure")
 
@@ -126,8 +114,6 @@ class DataProcessor:
         processed["taker_buy_base"] = df["Taker Buy Base"].astype(float)
         processed["taker_buy_quote"] = df["Taker Buy Quote"].astype(float)
 
-        # volatility
-        processed["volatility"] = DataProcessor.calculate_volatility(processed, period=config.VOLATILITY_WINDOW)
 
 
         # Gap log (optional)

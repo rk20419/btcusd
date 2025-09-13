@@ -25,7 +25,7 @@ class Config:
     PING_INTERVAL: int = 30
     PING_TIMEOUT: int = 10
     MAX_RECONNECTS: int = 10
-    VOLATILITY_WINDOW: int = 10
+    # VOLATILITY_WINDOW: int = 10
     PRICE_HISTORY_MAX_LEN: int = 100
     TIMEZONE: str = "Asia/Kolkata"  # Match historical fetcher
 
@@ -59,14 +59,14 @@ class DataManager:
     def initialize_files():
         # Raw tick data
         if not os.path.exists(config.RAW_DATA_FILE):
-            pd.DataFrame(columns=["timestamp", "price", "volatility", "datetime_ist"]).to_csv(
+            pd.DataFrame(columns=["timestamp", "price", "datetime_ist"]).to_csv(
                 config.RAW_DATA_FILE, index=False
             )
         # OHLCV candles per timeframe
         columns_to_save = [
             "timestamp","open","high","low","close","volume",
             "quote_volume","trades","taker_buy_base","taker_buy_quote",
-            "volatility","datetime_ist"
+            "datetime_ist"
         ]
         for tf in config.TIMEFRAMES:
             filepath = os.path.join(config.OUTPUT_DIR, f"{tf}.csv")
@@ -90,7 +90,7 @@ class DataManager:
 
     @staticmethod
     def save_candle(tf: str, data: Dict[str, float]) -> bool:
-        """Append OHLCV candle with IST datetime - includes volatility"""
+        """Append OHLCV candle with IST datetime - includes """
         try:
             filepath = os.path.join(config.OUTPUT_DIR, f"{tf}.csv")
             tz = pytz.timezone(config.TIMEZONE)
@@ -116,22 +116,22 @@ class BinanceWebSocket:
         DataManager.initialize_directories()
         DataManager.initialize_files()
 
-    def _calculate_volatility(self, current_price: float) -> float:
-        """
-        Calculate volatility (%) as rolling std deviation of returns, multiplied by 100
-        Using configured window length.
-        """
-        self.price_history.append(current_price)
-        if len(self.price_history) > config.PRICE_HISTORY_MAX_LEN:
-            self.price_history.pop(0)
+    # def _calculate_volatility(self, current_price: float) -> float:
+    #     """
+    #     Calculate volatility (%) as rolling std deviation of returns, multiplied by 100
+    #     Using configured window length.
+    #     """
+    #     self.price_history.append(current_price)
+    #     if len(self.price_history) > config.PRICE_HISTORY_MAX_LEN:
+    #         self.price_history.pop(0)
 
-        if len(self.price_history) >= config.VOLATILITY_WINDOW:
-            prices = pd.Series(self.price_history)
-            returns = prices.pct_change().dropna()
-            if len(returns) >= 2:
-                vol = returns.std() * 100
-                return float(round(vol, 5))  # rounded to 5 decimals for CSV simplicity
-        return 0.0
+    #     if len(self.price_history) >= config.VOLATILITY_WINDOW:
+    #         prices = pd.Series(self.price_history)
+    #         returns = prices.pct_change().dropna()
+    #         if len(returns) >= 2:
+    #             vol = returns.std() * 100
+    #             return float(round(vol, 5))  # rounded to 5 decimals for CSV simplicity
+    #     return 0.0
 
     def _handle_message(self, ws, message: str):
         with self.lock:
@@ -156,8 +156,8 @@ class BinanceWebSocket:
     def _process_kline(self, kline: Dict, timeframe: str):
         try:
             current_price = float(kline["c"])
-            volatility = self._calculate_volatility(current_price)
-            tick_data = {"timestamp": int(kline["t"]), "price": current_price, "volatility": volatility}
+            # volatility = self._calculate_volatility(current_price)
+            tick_data = {"timestamp": int(kline["t"]), "price": current_price,}
             DataManager.save_raw_tick(tick_data)
 
             if kline.get("x", False):  # Closed candle
@@ -172,10 +172,10 @@ class BinanceWebSocket:
                     "trades": int(kline.get("n", 0)),
                     "taker_buy_base": float(kline.get("V", 0.0)),
                     "taker_buy_quote": float(kline.get("Q", 0.0)),
-                    "volatility": volatility
+                    # "volatility": volatility
                 }
                 if DataManager.save_candle(timeframe, candle_data):
-                    logger.info(f"Saved {timeframe} candle | Price: {current_price:.2f} | Volatility: {volatility:.5f}%")
+                    logger.info(f"Saved {timeframe} candle | Price: {current_price:.2f}")
         except Exception as e:
             logger.error(f"Kline processing error: {str(e)}")
 
@@ -239,7 +239,7 @@ if __name__ == "__main__":
     ws_client = BinanceWebSocket()
     signal.signal(signal.SIGINT, shutdown_handler)
     signal.signal(signal.SIGTERM, shutdown_handler)
-    logger.info("Starting live WebSocket BTC/USDT data collection with volatility...")
+    logger.info("Starting live WebSocket BTC/USDT data collection...")
     try:
         ws_client.run()
     except Exception as e:
